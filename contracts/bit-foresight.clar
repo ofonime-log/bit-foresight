@@ -180,3 +180,97 @@
     (ok true)
   )
 )
+
+;; Claim Forecasting Rewards
+;; Enables winning participants to claim proportional rewards from resolved markets
+(define-public (claim-forecast-rewards (market-id uint))
+  (let (
+      (market-data (unwrap! (map-get? prediction-markets market-id) ERR-RESOURCE-NOT-FOUND))
+      (position-data (unwrap!
+        (map-get? participant-positions {
+          market-id: market-id,
+          participant: tx-sender,
+        })
+        ERR-RESOURCE-NOT-FOUND
+      ))
+    )
+    ;; Settlement and claim validation
+    (asserts! (get is-resolved market-data) ERR-MARKET-INACTIVE)
+    (asserts! (not (get rewards-claimed position-data)) ERR-REWARD-CLAIMED)
+    (let (
+        ;; Determine winning direction based on price movement
+        (winning-direction (if (> (get final-btc-price market-data)
+            (get initial-btc-price market-data)
+          )
+          "bull"
+          "bear"
+        ))
+        (total-pool (+ (get bullish-pool market-data) (get bearish-pool market-data)))
+        (winning-pool (if (is-eq winning-direction "bull")
+          (get bullish-pool market-data)
+          (get bearish-pool market-data)
+        ))
+      )
+      ;; Verify participant backed winning direction
+      (asserts! (is-eq (get price-direction position-data) winning-direction)
+        ERR-INVALID-FORECAST
+      )
+      (let (
+          ;; Calculate proportional rewards and protocol fee
+          (total-reward (/ (* (get staked-amount position-data) total-pool) winning-pool))
+          (protocol-fee (/ (* total-reward (var-get protocol-fee-rate)) u100))
+          (net-payout (- total-reward protocol-fee))
+        )
+        ;; Distribute rewards to participant
+        (try! (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender)))
+        ;; Transfer protocol fee to admin
+        (try! (as-contract (stx-transfer? protocol-fee (as-contract tx-sender) PROTOCOL_ADMIN)))
+        ;; Mark position as claimed
+        (map-set participant-positions {
+          market-id: market-id,
+          participant: tx-sender,
+        }
+          (merge position-data { rewards-claimed: true })
+        )
+        (ok net-payout)
+      )
+    )
+  )
+)
+
+;; READ-ONLY DATA ACCESS
+
+;; Retrieve Market Data
+;; Returns complete market information for external queries
+(define-read-only (get-market-data (market-id uint))
+  (map-get? prediction-markets market-id)
+)
+
+;; Retrieve Participant Position
+;; Returns user's position data for specified market
+(define-read-only (get-participant-position
+    (market-id uint)
+    (participant principal)
+  )
+  (map-get? participant-positions {
+    market-id: market-id,
+    participant: participant,
+  })
+)
+
+;; Get Protocol Treasury Balance
+;; Returns total STX held in protocol escrow
+(define-read-only (get-protocol-treasury)
+  (stx-get-balance (as-contract tx-sender))
+)
+
+;; Get Protocol Configuration
+;; Returns current protocol parameters for transparency
+(define-read-only (get-protocol-settings)
+  {
+    oracle-endpoint: (var-get price-oracle-endpoint),
+    minimum-stake: (var-get min-participation-threshold),
+    fee-rate: (var-get protocol-fee-rate),
+    total-markets: (var-get global-market-index),
+  }
+)
