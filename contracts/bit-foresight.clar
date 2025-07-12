@@ -64,3 +64,119 @@
     rewards-claimed: bool, ;; Payout status tracker
   }
 )
+
+;; CORE PROTOCOL FUNCTIONS
+
+;; Initialize New Prediction Market
+;; Creates a new Bitcoin price forecasting market with specified parameters
+(define-public (initialize-prediction-market
+    (btc-price uint)
+    (open-height uint)
+    (close-height uint)
+  )
+  (let ((new-market-id (var-get global-market-index)))
+    ;; Administrative access validation
+    (asserts! (is-eq tx-sender PROTOCOL_ADMIN) ERR-UNAUTHORIZED-ACCESS)
+    ;; Input parameter validation
+    (asserts! (> close-height open-height) ERR-INVALID-INPUT)
+    (asserts! (> btc-price u0) ERR-INVALID-INPUT)
+    ;; Market initialization with default state
+    (map-set prediction-markets new-market-id {
+      initial-btc-price: btc-price,
+      final-btc-price: u0,
+      bullish-pool: u0,
+      bearish-pool: u0,
+      market-open-height: open-height,
+      market-close-height: close-height,
+      is-resolved: false,
+    })
+    ;; Increment global market counter
+    (var-set global-market-index (+ new-market-id u1))
+    (ok new-market-id)
+  )
+)
+
+;; Submit Market Prediction
+;; Enables users to stake STX tokens on Bitcoin price direction forecasts
+(define-public (submit-forecast
+    (market-id uint)
+    (direction (string-ascii 4))
+    (stake-amount uint)
+  )
+  (let (
+      (market-data (unwrap! (map-get? prediction-markets market-id) ERR-RESOURCE-NOT-FOUND))
+      (current-height stacks-block-height)
+    )
+    ;; Market activity window validation
+    (asserts!
+      (and
+        (>= current-height (get market-open-height market-data))
+        (< current-height (get market-close-height market-data))
+      )
+      ERR-MARKET-INACTIVE
+    )
+    ;; Forecast parameter validation
+    (asserts! (or (is-eq direction "bull") (is-eq direction "bear"))
+      ERR-INVALID-FORECAST
+    )
+    (asserts! (>= stake-amount (var-get min-participation-threshold))
+      ERR-INVALID-FORECAST
+    )
+    (asserts! (<= stake-amount (stx-get-balance tx-sender))
+      ERR-INSUFFICIENT-FUNDS
+    )
+    ;; Transfer stake to contract escrow
+    (try! (stx-transfer? stake-amount tx-sender (as-contract tx-sender)))
+    ;; Register participant position
+    (map-set participant-positions {
+      market-id: market-id,
+      participant: tx-sender,
+    } {
+      price-direction: direction,
+      staked-amount: stake-amount,
+      rewards-claimed: false,
+    })
+    ;; Update market pool balances
+    (map-set prediction-markets market-id
+      (merge market-data {
+        bullish-pool: (if (is-eq direction "bull")
+          (+ (get bullish-pool market-data) stake-amount)
+          (get bullish-pool market-data)
+        ),
+        bearish-pool: (if (is-eq direction "bear")
+          (+ (get bearish-pool market-data) stake-amount)
+          (get bearish-pool market-data)
+        ),
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Settle Market with Oracle Data
+;; Oracle-authorized function to finalize Bitcoin price and resolve market outcomes
+(define-public (settle-market-outcome
+    (market-id uint)
+    (settlement-price uint)
+  )
+  (let ((market-data (unwrap! (map-get? prediction-markets market-id) ERR-RESOURCE-NOT-FOUND)))
+    ;; Oracle authorization verification
+    (asserts! (is-eq tx-sender (var-get price-oracle-endpoint))
+      ERR-UNAUTHORIZED-ACCESS
+    )
+    ;; Market closure timing validation
+    (asserts! (>= stacks-block-height (get market-close-height market-data))
+      ERR-MARKET-INACTIVE
+    )
+    (asserts! (not (get is-resolved market-data)) ERR-MARKET-INACTIVE)
+    (asserts! (> settlement-price u0) ERR-INVALID-INPUT)
+    ;; Finalize market with settlement data
+    (map-set prediction-markets market-id
+      (merge market-data {
+        final-btc-price: settlement-price,
+        is-resolved: true,
+      })
+    )
+    (ok true)
+  )
+)
